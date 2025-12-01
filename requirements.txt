@@ -1,4 +1,4 @@
-python-telegram-bot==20.7
+python-telegram-bot[webhooks]==20.7
 deep-translator==1.11.4
 SpeechRecognition==3.14.4
 pydub==0.25.1
