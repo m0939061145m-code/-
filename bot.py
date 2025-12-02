@@ -1,9 +1,13 @@
-import os
+# app.py / bot.py
+# Telegram voice translator with groups, limits, passwords and TTS
+
+import asyncio
+import datetime
 import logging
-from datetime import date
-from pathlib import Path
-from io import BytesIO
+import os
 import tempfile
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Tuple
 
 from deep_translator import GoogleTranslator
 from gtts import gTTS
@@ -11,21 +15,23 @@ from pydub import AudioSegment
 import speech_recognition as sr
 
 from telegram import (
-    Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    Update,
+    InputFile,
 )
 from telegram.ext import (
     Application,
+    CallbackContext,
+    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
 
 # ---------------------------------------
-# БАЗОВЫЙ КОНФИГ
+# Конфиг
 # ---------------------------------------
 
 logging.basicConfig(
@@ -35,819 +41,802 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-BASE_WEBHOOK_URL = os.getenv("BASE_WEBHOOK_URL")
+BASE_URL = os.getenv("BASE_URL", "https://bratik.onrender.com")
+BASE_WEBHOOK_URL = os.getenv("BASE_WEBHOOK_URL")  # если есть – используем
 PORT = int(os.getenv("PORT", "10000"))
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN не задан в переменных окружения")
+    logger.error("BOT_TOKEN не задан в переменных окружения")
+    raise SystemExit("BOT_TOKEN env is required")
 
-# Админы (видят /adminhelp и всегда без лимита)
-OWNER_ID = 7707071177
-FRIEND_ID = 1300323894
-ADMINS = {OWNER_ID, FRIEND_ID}
-UNLIMITED_USERS = {OWNER_ID, FRIEND_ID}
+# Админы (могут видеть /help_admin)
+ADMIN_IDS = {7707071177, 1300323894}
 
-# Группы и лимиты
+# Друг с безлимитом
+FRIEND_UNLIMITED_ID = 1300323894
+
+# Лимиты по группам (в день)
 GROUP_LIMITS = {
-    "free": 30,   # DEMO / Free
+    "free": 30,
     "a1": 30,
     "a2": 60,
     "b1": 100,
-    "vip": None,  # None = безлимит
+    "pro": None,  # None = безлимит
 }
 
-GROUP_LABELS_RU = {
-    "free": "Free (DEMO)",
-    "a1": "Группа A1",
-    "a2": "Группа A2",
-    "b1": "Группа B1",
-    "vip": "VIP (безлимит)",
-}
-
-GROUP_TEACHERS_RU = {
-    "free": "—",
-    "a1": "Юрий Николаевич",
-    "a2": "Преподаватель A2",
-    "b1": "Преподаватель B1",
-    "vip": "Индивидуальный доступ",
-}
-
-GROUP_PASSWORDS = {
+# Пароли для групп
+PASSWORDS = {
     "karbofos-a1": "a1",
     "karbofos-a2": "a2",
     "karbofos-b1": "b1",
-    "karbofos-vip": "vip",
+    "karbofos-vip": "pro",
 }
 
-# Направления перевода: любой ↔ DE
-DIRECTIONS = {
-    "ru_de": {"label": "🇷🇺 RU ➝ 🇩🇪 DE", "src": "ru", "dest": "de", "stt_locale": "ru-RU"},
-    "de_ru": {"label": "🇩🇪 DE ➝ 🇷🇺 RU", "src": "de", "dest": "ru", "stt_locale": "de-DE"},
-    "en_de": {"label": "🇬🇧 EN ➝ 🇩🇪 DE", "src": "en", "dest": "de", "stt_locale": "en-US"},
-    "de_en": {"label": "🇩🇪 DE ➝ 🇬🇧 EN", "src": "de", "dest": "en", "stt_locale": "de-DE"},
-    "tr_de": {"label": "🇹🇷 TR ➝ 🇩🇪 DE", "src": "tr", "dest": "de", "stt_locale": "tr-TR"},
-    "de_tr": {"label": "🇩🇪 DE ➝ 🇹🇷 TR", "src": "de", "dest": "tr", "stt_locale": "de-DE"},
-    "ro_de": {"label": "🇷🇴 RO ➝ 🇩🇪 DE", "src": "ro", "dest": "de", "stt_locale": "ro-RO"},
-    "de_ro": {"label": "🇩🇪 DE ➝ 🇷🇴 RO", "src": "de", "dest": "ro", "stt_locale": "de-DE"},
-    "pl_de": {"label": "🇵🇱 PL ➝ 🇩🇪 DE", "src": "pl", "dest": "de", "stt_locale": "pl-PL"},
-    "de_pl": {"label": "🇩🇪 DE ➝ 🇵🇱 PL", "src": "de", "dest": "pl", "stt_locale": "de-DE"},
-    "ar_de": {"label": "🇸🇾 AR(SY) ➝ 🇩🇪 DE", "src": "ar", "dest": "de", "stt_locale": "ar-SY"},
-    "de_ar": {"label": "🇩🇪 DE ➝ 🇸🇾 AR(SY)", "src": "de", "dest": "ar", "stt_locale": "de-DE"},
+# Поддерживаемые языки интерфейса
+SUPPORTED_UI_LANGS = ["ru", "en", "de", "tr", "ro", "pl", "ar"]
+
+# ---------------------------------------
+# Направления перевода
+# ---------------------------------------
+
+@dataclass
+class Direction:
+    code: str
+    src_lang: str
+    dest_lang: str
+    label: str
+    speech_locale: str
+    tts_lang: str
+
+
+DIRECTIONS: Dict[str, Direction] = {
+    # RU <-> DE
+    "ru_de": Direction("ru_de", "ru", "de", "🇷🇺 RU → 🇩🇪 DE", "ru-RU", "de"),
+    "de_ru": Direction("de_ru", "de", "ru", "🇩🇪 DE → 🇷🇺 RU", "de-DE", "ru"),
+    # EN <-> DE
+    "en_de": Direction("en_de", "en", "de", "🇬🇧 EN → 🇩🇪 DE", "en-US", "de"),
+    "de_en": Direction("de_en", "de", "en", "🇩🇪 DE → 🇬🇧 EN", "de-DE", "en"),
+    # TR <-> DE
+    "tr_de": Direction("tr_de", "tr", "de", "🇹🇷 TR → 🇩🇪 DE", "tr-TR", "de"),
+    "de_tr": Direction("de_tr", "de", "tr", "🇩🇪 DE → 🇹🇷 TR", "de-DE", "tr"),
+    # RO <-> DE
+    "ro_de": Direction("ro_de", "ro", "de", "🇷🇴 RO → 🇩🇪 DE", "ro-RO", "de"),
+    "de_ro": Direction("de_ro", "de", "ro", "🇩🇪 DE → 🇷🇴 RO", "de-DE", "ro"),
+    # PL <-> DE
+    "pl_de": Direction("pl_de", "pl", "de", "🇵🇱 PL → 🇩🇪 DE", "pl-PL", "de"),
+    "de_pl": Direction("de_pl", "de", "pl", "🇩🇪 DE → 🇵🇱 PL", "de-DE", "pl"),
+    # AR(SY) <-> DE
+    "ar_de": Direction("ar_de", "ar", "de", "🇸🇾 AR(SY) → 🇩🇪 DE", "ar-SY", "de"),
+    "de_ar": Direction("de_ar", "de", "ar", "🇩🇪 DE → 🇸🇾 AR(SY)", "de-DE", "ar"),
 }
 
-# Язык озвучки (gTTS)
-TTS_LANG = {
-    "ru": "ru",
-    "de": "de",
-    "en": "en",
-    "tr": "tr",
-    "ro": "ro",
-    "pl": "pl",
-    "ar": "ar",
-}
+# Порядок кнопок на клавиатуре
+DIRECTION_ROWS = [
+    ("ru_de", "de_ru"),
+    ("en_de", "de_en"),
+    ("tr_de", "de_tr"),
+    ("ro_de", "de_ro"),
+    ("pl_de", "de_pl"),
+    ("ar_de", "de_ar"),
+]
 
-# Языки интерфейса
-UI_LANGS = {
-    "ru": {"flag": "🇷🇺", "label": "Русский"},
-    "de": {"flag": "🇩🇪", "label": "Deutsch"},
-    "en": {"flag": "🇬🇧", "label": "English"},
-    "tr": {"flag": "🇹🇷", "label": "Türkçe"},
-    "pl": {"flag": "🇵🇱", "label": "Polski"},
-    "ro": {"flag": "🇷🇴", "label": "Română"},
-    "ar": {"flag": "🇸🇾", "label": "العربية"},
-}
+DEFAULT_DIRECTION = "ru_de"
+DEFAULT_UI_LANG = "ru"
 
-# Тексты интерфейса (RU + EN; DE/TR/PL/RO/AR → используют EN как базу)
+# ---------------------------------------
+# Тексты (RU / EN). Остальные языки интерфейса
+# по факту падают на EN как fallback.
+# ---------------------------------------
+
 TEXTS = {
     "ru": {
         "start": (
-            "Привет! Я голосовой переводчик для курсов немецкого.\n\n"
-            "🎙 Просто пришли мне голосовое сообщение — я распознаю речь, переведу и пришлю текст.\n"
-            "🔊 Плюс могу озвучить перевод голосом.\n\n"
-            "📌 Текущее направление перевода: {direction}\n"
-            "👥 Текущая группа: {group_name}\n"
-            "📊 Лимит: {limit_line}\n"
-            "Сегодня использовано: {used}\n"
-            "Сегодня осталось: {left}\n\n"
-            "🔄 Направление можно сменить кнопкой ниже.\n"
-            "🔑 Чтобы снять ограничения, используй /password.\n"
-            "🌐 Язык интерфейса: {ui_lang_flag} {ui_lang_label} (команда /lang).\n\n"
-            "ℹ Команды: /help /pricing /status /groupinfo /lang"
+            "Привет! Я голосовой переводчик для курсов немецкого. 👋\n\n"
+            "🎙 Отправь мне голосовое — я распознаю речь, переведу и пришлю текст.\n"
+            "🔊 Плюс озвучу перевод голосом.\n\n"
+            "Текущее направление: {direction_label}\n"
+            "Текущая группа: {group_name}\n"
+            "Лимит: {limit_text}\n"
+            "Сегодня использовано: {used_today}\n"
+            "Сегодня осталось: {left_today}\n\n"
+            "📚 Выбери направление перевода кнопкой ниже.\n"
+            "🔑 Чтобы снять ограничения, введи пароль командой /password\n"
+            "ℹ /pricing — тарифы и способы оплаты\n"
+            "ℹ /status — твои лимиты\n"
+            "ℹ /groupinfo — статус доступа\n"
+            "🌐 /lang — язык интерфейса\n"
         ),
-        "limit_line_unlimited": "безлимит",
+        "help": (
+            "❓ Как пользоваться ботом:\n\n"
+            "1️⃣ Нажми /start.\n"
+            "2️⃣ Выбери направление перевода (RU→DE, EN→DE и т.д.).\n"
+            "3️⃣ Отправь голосовое или текст.\n"
+            "4️⃣ Я распознаю, переведу и озвучу перевод.\n\n"
+            "🔑 Чтобы получить больше переводов, используй /password\n"
+            "💳 /pricing — тарифы\n"
+            "📊 /status — остаток лимита на сегодня\n"
+            "👥 /groupinfo — какая у тебя группа (A1, A2, B1, PRO)\n"
+        ),
+        "help_admin": (
+            "🛠 Админ-help\n\n"
+            "• /status — посмотреть лимиты любого юзера (реплаем на его сообщение)\n"
+            "• Пароли групп:\n"
+            "  karbofos-a1 → A1 (30/день)\n"
+            "  karbofos-a2 → A2 (60/день)\n"
+            "  karbofos-b1 → B1 (100/день)\n"
+            "  karbofos-vip → PRO (безлимит)\n\n"
+            "Друг 1300323894 — всегда безлимит, независимо от группы."
+        ),
+        "pricing": (
+            "💳 Тарифы и лимиты в день:\n"
+            "• Free (DEMO) — 30 переводов/день, 0€\n"
+            "• 🎓 A1 — 9.99€ / месяц, 30 переводов/день\n"
+            "• 🎓 A2 — 14.99€ / месяц, 60 переводов/день\n"
+            "• 🎓 B1 — 19.99€ / месяц, 100 переводов/день\n"
+            "• 🥇 PRO (безлимит) — 39.99€ / месяц, безлимит\n\n"
+            "🧩 Дополнительно:\n"
+            "• Разовый доступ «1 неделя теста» — 4.99€\n\n"
+            "Оплата обсуждается с преподавателем "
+            "(наличные / банковский перевод / PayPal / Revolut / SEPA и т.п.)."
+        ),
+        "groupinfo": (
+            "👥 Информация по группам:\n\n"
+            "• A1 — преподаватель: Юрий Николаевич\n"
+            "• A2 — преподаватель: Преподаватель A2\n"
+            "• B1 — преподаватель: Преподаватель B1\n"
+            "• PRO — индивидуальный доступ (индивидуальные занятия / VIP)\n\n"
+            "Чтобы активировать правильный уровень, возьми пароль у своего преподавателя "
+            "и введи его через /password."
+        ),
+        "status": (
+            "📊 Твой статус:\n"
+            "Группа: {group_name}\n"
+            "Лимит в день: {limit_text}\n"
+            "Сегодня использовано: {used_today}\n"
+            "Сегодня осталось: {left_today}\n"
+        ),
         "limit_reached": (
             "⛔ Лимит переводов на сегодня исчерпан.\n"
-            "Твой тариф: {group_name}, лимит: {limit} в день.\n"
-            "Попроси преподавателя выдать пароль, чтобы повысить уровень доступа."
+            "Текущая группа: {group_name}, лимит: {limit_text}\n\n"
+            "💳 Посмотреть тарифы: /pricing\n"
+            "🔑 Ввести пароль от группы: /password"
         ),
-        "translation_header": "📥 Оригинал:\n{original}\n\n📤 Перевод ({src} ➝ {dest}):\n{translated}",
-        "no_speech": "😕 Не удалось распознать речь. Попробуй сказать чуть чётче или ближе к микрофону.",
-        "error_generic": "❌ Что-то пошло не так, попробуй ещё раз чуть позже.",
-        "password_usage": (
-            "🔑 Отправь пароль так (в одно сообщение):\n"
+        "password_howto": (
+            "🔑 Отправь пароль так:\n"
             "`/password karbofos-a1`\n\n"
             "Доступные примеры:\n"
             "`karbofos-a1`, `karbofos-a2`, `karbofos-b1`, `karbofos-vip`."
         ),
         "password_ok": (
-            "✅ Пароль принят.\n"
-            "Твоя новая группа: {group_name}.\n"
-            "Лимит в день: {limit_line}."
+            "✅ Группа успешно изменена на: {group_name}\n"
+            "Новый лимит: {limit_text}"
         ),
-        "password_bad": "❌ Неверный пароль. Проверь написание или уточни у преподавателя.",
-        "status": (
-            "📊 Статус доступа:\n"
-            "Группа: {group_name}\n"
-            "Лимит в день: {limit_line}\n"
-            "Сегодня использовано: {used}\n"
-            "Сегодня осталось: {left}"
+        "password_bad": "❌ Неверный пароль. Проверь у преподавателя.",
+        "send_password": "🔑 Введи пароль в формате: `/password karbofos-a1`",
+        "direction_set": "✅ Направление перевода установлено: {direction_label}",
+        "recognizing": "🎧 Распознаю речь…",
+        "nothing_recognized": "😔 Не удалось распознать речь. Попробуй записать ещё раз.",
+        "translation_reply": (
+            "💬 *Оригинал* ({src}):\n"
+            "`{original}`\n\n"
+            "🌍 *Перевод* ({dest}):\n"
+            "`{translated}`"
         ),
-        "pricing": (
-            "💳 Тарифы и лимиты в день:\n"
-            "• Free (DEMO) — 30 переводов\n"
-            "• A1 — 30 переводов\n"
-            "• A2 — 60 переводов\n"
-            "• B1 — 100 переводов\n"
-            "• VIP — безлимит\n\n"
-            "Оплата: обсуждается с преподавателем (наличные / перевод / PayPal / Revolut / SEPA и т.п.)."
-        ),
-        "groupinfo": (
-            "👥 Информация по группам:\n"
-            "• A1 — преподаватель: {a1}\n"
-            "• A2 — преподаватель: {a2}\n"
-            "• B1 — преподаватель: {b1}\n"
-            "• VIP — индивидуальный доступ ({vip})\n\n"
-            "Чтобы активировать правильный уровень, возьми пароль у своего преподавателя и введи его через /password."
-        ),
-        "help_student": (
-            "📚 Как пользоваться ботом:\n\n"
-            "1️⃣ Нажми /start и выбери нужное направление перевода (RU↔DE, EN↔DE и т.д.).\n"
-            "2️⃣ Отправь голосовое сообщение — я распознаю текст и переведу его.\n"
-            "3️⃣ Я отправлю перевод текстом и, если возможно, озвучу его голосом.\n"
-            "4️⃣ Следи за лимитом через /status. Чтобы расширить лимит, используй пароль от преподавателя через /password.\n"
-            "5️⃣ /pricing — тарифы, /groupinfo — инфо по группам, /lang — смена языка интерфейса.\n\n"
-            "Если что-то работает странно — скажи преподавателю или напиши моему создателю 😉"
+        "text_limit_warn": (
+            "ℹ Текстовые сообщения тоже учитываются в лимит переводов."
         ),
         "lang_choose": "🌐 Выбери язык интерфейса:",
-        "lang_set": "✅ Язык интерфейса установлен: {flag} {label}",
-        "admin_denied": "⛔ Эта команда только для администратора.",
-        "admin_header": "🛠 Админ-панель Bratik Voice Translator",
-        "admin_body": (
-            "Пользователей всего: {total_users}\n"
-            "Группы:\n"
-            "• Free: {free}\n"
-            "• A1: {a1}\n"
-            "• A2: {a2}\n"
-            "• B1: {b1}\n"
-            "• VIP: {vip}\n\n"
-            "Сегодняшние использования (суммарно по всем): {total_used_today}"
-        ),
+        "lang_set": "✅ Язык интерфейса установлен: {lang_code}",
+        "only_for_admin": "Эта команда только для администратора.",
     },
     "en": {
         "start": (
-            "Hi! I'm a voice translator for German courses.\n\n"
-            "🎙 Just send me a voice message – I’ll recognize the speech, translate it and send the text.\n"
-            "🔊 I can also speak the translation aloud.\n\n"
-            "📌 Current direction: {direction}\n"
-            "👥 Current group: {group_name}\n"
-            "📊 Limit: {limit_line}\n"
-            "Used today: {used}\n"
-            "Left today: {left}\n\n"
-            "🔄 You can change the direction with the buttons below.\n"
-            "🔑 To remove limits, use /password.\n"
-            "🌐 Interface language: {ui_lang_flag} {ui_lang_label} (/lang).\n\n"
-            "ℹ Commands: /help /pricing /status /groupinfo /lang"
+            "Hi! I’m a voice translator bot for German courses. 👋\n\n"
+            "🎙 Send me a voice message — I’ll recognize speech, translate it and send the text back.\n"
+            "🔊 I will also voice the translation.\n\n"
+            "Current direction: {direction_label}\n"
+            "Current group: {group_name}\n"
+            "Daily limit: {limit_text}\n"
+            "Used today: {used_today}\n"
+            "Left today: {left_today}\n\n"
+            "📚 Choose translation direction with the buttons below.\n"
+            "🔑 To unlock higher limits, use /password\n"
+            "ℹ /pricing — pricing & payment methods\n"
+            "ℹ /status — your current limit\n"
+            "ℹ /groupinfo — access status\n"
+            "🌐 /lang — interface language\n"
         ),
-        "limit_line_unlimited": "unlimited",
+        "help": (
+            "❓ How to use the bot:\n\n"
+            "1️⃣ Press /start.\n"
+            "2️⃣ Choose translation direction (EN→DE, RU→DE, etc.).\n"
+            "3️⃣ Send a voice message or text.\n"
+            "4️⃣ I will recognize, translate and voice the result.\n\n"
+            "🔑 Use /password to upgrade your plan.\n"
+            "💳 /pricing — plans\n"
+            "📊 /status — today’s remaining limit\n"
+            "👥 /groupinfo — your level (A1, A2, B1, PRO)\n"
+        ),
+        "help_admin": (
+            "🛠 Admin help\n\n"
+            "• /status — check limits (by replying to a user’s message)\n"
+            "• Group passwords:\n"
+            "  karbofos-a1 → A1 (30/day)\n"
+            "  karbofos-a2 → A2 (60/day)\n"
+            "  karbofos-b1 → B1 (100/day)\n"
+            "  karbofos-vip → PRO (unlimited)\n\n"
+            "Friend 1300323894 has unlimited access regardless of group."
+        ),
+        "pricing": (
+            "💳 Plans and daily limits:\n"
+            "• Free (DEMO) — 30 translations/day, 0€\n"
+            "• 🎓 A1 — 9.99€ / month, 30 translations/day\n"
+            "• 🎓 A2 — 14.99€ / month, 60 translations/day\n"
+            "• 🎓 B1 — 19.99€ / month, 100 translations/day\n"
+            "• 🥇 PRO (unlimited) — 39.99€ / month, unlimited\n\n"
+            "🧩 Additionally:\n"
+            "• One-week trial access — 4.99€\n\n"
+            "Payment is arranged with your teacher "
+            "(cash / bank transfer / PayPal / Revolut / SEPA, etc.)."
+        ),
+        "groupinfo": (
+            "👥 Groups info:\n\n"
+            "• A1 — teacher: Yuriy Nikolaevich\n"
+            "• A2 — teacher: A2 Teacher\n"
+            "• B1 — teacher: B1 Teacher\n"
+            "• PRO — individual access (1:1 / VIP)\n\n"
+            "To activate the correct level, get a password from your teacher "
+            "and enter it via /password."
+        ),
+        "status": (
+            "📊 Your status:\n"
+            "Group: {group_name}\n"
+            "Daily limit: {limit_text}\n"
+            "Used today: {used_today}\n"
+            "Left today: {left_today}\n"
+        ),
         "limit_reached": (
-            "⛔ You’ve reached today’s translation limit.\n"
-            "Your plan: {group_name}, daily limit: {limit}.\n"
-            "Ask your teacher for a password to upgrade your access."
+            "⛔ Your daily translation limit is reached.\n"
+            "Current group: {group_name}, limit: {limit_text}\n\n"
+            "💳 Check plans: /pricing\n"
+            "🔑 Enter group password: /password"
         ),
-        "translation_header": "📥 Original:\n{original}\n\n📤 Translation ({src} ➝ {dest}):\n{translated}",
-        "no_speech": "😕 I couldn't recognize your voice. Please speak a bit clearer or closer to the microphone.",
-        "error_generic": "❌ Something went wrong, please try again later.",
-        "password_usage": (
-            "🔑 Send the password like this (one message):\n"
+        "password_howto": (
+            "🔑 Send password like this:\n"
             "`/password karbofos-a1`\n\n"
             "Available examples:\n"
             "`karbofos-a1`, `karbofos-a2`, `karbofos-b1`, `karbofos-vip`."
         ),
         "password_ok": (
-            "✅ Password accepted.\n"
-            "Your new group: {group_name}.\n"
-            "Daily limit: {limit_line}."
+            "✅ Group changed to: {group_name}\n"
+            "New limit: {limit_text}"
         ),
-        "password_bad": "❌ Wrong password. Please check the spelling or ask your teacher.",
-        "status": (
-            "📊 Access status:\n"
-            "Group: {group_name}\n"
-            "Daily limit: {limit_line}\n"
-            "Used today: {used}\n"
-            "Left today: {left}"
+        "password_bad": "❌ Wrong password. Ask your teacher.",
+        "send_password": "🔑 Send password in format: `/password karbofos-a1`",
+        "direction_set": "✅ Translation direction set: {direction_label}",
+        "recognizing": "🎧 Recognizing speech…",
+        "nothing_recognized": "😔 Couldn’t recognize speech. Please try again.",
+        "translation_reply": (
+            "💬 *Original* ({src}):\n"
+            "`{original}`\n\n"
+            "🌍 *Translation* ({dest}):\n"
+            "`{translated}`"
         ),
-        "pricing": (
-            "💳 Plans and daily limits:\n"
-            "• Free (DEMO) — 30 translations\n"
-            "• A1 — 30 translations\n"
-            "• A2 — 60 translations\n"
-            "• B1 — 100 translations\n"
-            "• VIP — unlimited\n\n"
-            "Payment: arranged with your teacher (cash / bank transfer / PayPal / Revolut / SEPA etc.)."
-        ),
-        "groupinfo": (
-            "👥 Groups info:\n"
-            "• A1 — teacher: {a1}\n"
-            "• A2 — teacher: {a2}\n"
-            "• B1 — teacher: {b1}\n"
-            "• VIP — individual access ({vip})\n\n"
-            "To activate your level, get a password from your teacher and enter it via /password."
-        ),
-        "help_student": (
-            "📚 How to use the bot:\n\n"
-            "1️⃣ Tap /start and choose the direction (RU↔DE, EN↔DE, etc.).\n"
-            "2️⃣ Send a voice message – I will recognize the speech and translate it.\n"
-            "3️⃣ I’ll send the translation as text and, when possible, as voice.\n"
-            "4️⃣ Check your limit via /status. To increase it, use a password from your teacher via /password.\n"
-            "5️⃣ /pricing — plans, /groupinfo — group info, /lang — change interface language.\n\n"
-            "If something looks weird, tell your teacher or my creator 😉"
-        ),
+        "text_limit_warn": "ℹ Text messages also count towards your limit.",
         "lang_choose": "🌐 Choose interface language:",
-        "lang_set": "✅ Interface language set to {flag} {label}",
-        "admin_denied": "⛔ This command is for admin only.",
-        "admin_header": "🛠 Bratik Voice Translator — admin panel",
-        "admin_body": (
-            "Total users: {total_users}\n"
-            "Groups:\n"
-            "• Free: {free}\n"
-            "• A1: {a1}\n"
-            "• A2: {a2}\n"
-            "• B1: {b1}\n"
-            "• VIP: {vip}\n\n"
-            "Total translations used today: {total_used_today}"
-        ),
+        "lang_set": "✅ Interface language set: {lang_code}",
+        "only_for_admin": "This command is for admins only.",
     },
 }
 
-# ---------------------------------------
-# Память по пользователям (в RAM)
-# ---------------------------------------
 
-# user_id -> state dict
-USERS: dict[int, dict] = {}
-
-
-def get_user_state(user_id: int) -> dict:
-    """Гарантированно вернуть словарь состояния пользователя."""
-    if user_id not in USERS:
-        USERS[user_id] = {
-            "direction": "ru_de",
-            "group": "free",
-            "ui_lang": "ru",
-            "used_today": 0,
-            "last_date": date.today().isoformat(),
-        }
-    # сброс счётчика, если новый день
-    today_str = date.today().isoformat()
-    if USERS[user_id]["last_date"] != today_str:
-        USERS[user_id]["last_date"] = today_str
-        USERS[user_id]["used_today"] = 0
-    return USERS[user_id]
-
-
-def get_ui_lang(user_id: int) -> str:
-    state = get_user_state(user_id)
-    lang = state.get("ui_lang", "ru")
-    if lang not in UI_LANGS:
-        lang = "ru"
-    return lang
-
-
-def set_ui_lang(user_id: int, lang: str) -> None:
-    state = get_user_state(user_id)
-    if lang in UI_LANGS:
-        state["ui_lang"] = lang
-    else:
-        state["ui_lang"] = "ru"
-
-
-def L(user_id: int, key: str) -> str:
-    """Вернуть текст по ключу с учётом языка пользователя."""
-    lang = get_ui_lang(user_id)
-    if lang in ("ru",):
-        base = TEXTS["ru"]
-    elif lang in ("de", "tr", "pl", "ro", "ar"):
-        base = TEXTS["en"]
-    else:
-        base = TEXTS.get(lang, TEXTS["ru"])
-    # для некоторых ключей fallback на en/ru
-    if key in base:
-        return base[key]
-    if key in TEXTS["en"]:
+def get_text(lang: str, key: str) -> str:
+    """Получить текст с учётом fallback."""
+    if lang in TEXTS and key in TEXTS[lang]:
+        return TEXTS[lang][key]
+    # fallback на EN
+    if "en" in TEXTS and key in TEXTS["en"]:
         return TEXTS["en"][key]
+    # fallback на RU
     return TEXTS["ru"].get(key, "")
 
 
-def format_limit_line(user_id: int, limit: int | None) -> str:
-    if limit is None:
-        return L(user_id, "limit_line_unlimited")
-    return str(limit)
+# ---------------------------------------
+# User state
+# ---------------------------------------
+
+@dataclass
+class UserState:
+    ui_lang: str = DEFAULT_UI_LANG
+    direction_code: str = DEFAULT_DIRECTION
+    group: str = "free"  # free, a1, a2, b1, pro
+    used_today: int = 0
+    last_date: datetime.date = field(default_factory=lambda: datetime.date.today())
 
 
-def get_daily_limit(user_id: int, state: dict | None = None) -> int | None:
-    if user_id in UNLIMITED_USERS:
+USER_STATE: Dict[int, UserState] = {}
+
+
+def get_user_state(user_id: int) -> UserState:
+    if user_id not in USER_STATE:
+        USER_STATE[user_id] = UserState()
+    st = USER_STATE[user_id]
+
+    # если новый день — обнуляем счётчик
+    today = datetime.date.today()
+    if st.last_date != today:
+        st.last_date = today
+        st.used_today = 0
+    return st
+
+
+def group_name_rus(group: str) -> str:
+    mapping = {
+        "free": "Free (DEMO)",
+        "a1": "A1",
+        "a2": "A2",
+        "b1": "B1",
+        "pro": "PRO",
+    }
+    return mapping.get(group, group)
+
+
+def group_name_en(group: str) -> str:
+    mapping = {
+        "free": "Free (DEMO)",
+        "a1": "A1",
+        "a2": "A2",
+        "b1": "B1",
+        "pro": "PRO",
+    }
+    return mapping.get(group, group)
+
+
+def get_limit_for_user(user_id: int, group: str) -> Optional[int]:
+    # друг — всегда безлимит
+    if user_id == FRIEND_UNLIMITED_ID:
         return None
-    if state is None:
-        state = get_user_state(user_id)
-    group = state.get("group", "free")
     return GROUP_LIMITS.get(group, GROUP_LIMITS["free"])
 
 
-def check_and_increment_usage(user_id: int) -> tuple[bool, int | None, int, int | None]:
-    """
-    Возвращает:
-      (ok, limit, used_after, left)
-    """
-    state = get_user_state(user_id)
-    limit = get_daily_limit(user_id, state)
-    used = state["used_today"]
+def format_limit_text(limit: Optional[int], lang: str) -> str:
+    if limit is None:
+        return "безлимит" if lang == "ru" else "unlimited"
+    if lang == "ru":
+        return f"{limit} переводов/день"
+    return f"{limit} translations/day"
 
-    if limit is not None and used >= limit:
-        left = 0
-        return False, limit, used, left
 
-    state["used_today"] += 1
-    used = state["used_today"]
-    left = None if limit is None else max(limit - used, 0)
-    return True, limit, used, left
+def check_and_consume(user_id: int) -> Tuple[bool, int, Optional[int]]:
+    """
+    Возвращает (ok, used_today, limit).
+    ok=False, если лимит превышен.
+    """
+    st = get_user_state(user_id)
+    limit = get_limit_for_user(user_id, st.group)
+    if limit is None:
+        return True, st.used_today, limit
+    if st.used_today >= limit:
+        return False, st.used_today, limit
+    st.used_today += 1
+    return True, st.used_today, limit
+
+
+def build_direction_keyboard(current_code: str) -> InlineKeyboardMarkup:
+    rows = []
+    for left_code, right_code in DIRECTION_ROWS:
+        row = []
+        for code in (left_code, right_code):
+            dir_obj = DIRECTIONS[code]
+            prefix = "✅ " if code == current_code else ""
+            row.append(
+                InlineKeyboardButton(
+                    text=prefix + dir_obj.label,
+                    callback_data=f"dir:{code}",
+                )
+            )
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+def build_lang_keyboard(current_lang: str) -> InlineKeyboardMarkup:
+    rows = []
+    for code in SUPPORTED_UI_LANGS:
+        prefix = "✅ " if code == current_lang else ""
+        flag = {
+            "ru": "🇷🇺",
+            "en": "🇬🇧",
+            "de": "🇩🇪",
+            "tr": "🇹🇷",
+            "ro": "🇷🇴",
+            "pl": "🇵🇱",
+            "ar": "🇸🇾",
+        }.get(code, "🌐")
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{prefix}{flag} {code.upper()}",
+                    callback_data=f"lang:{code}",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
 
 
 # ---------------------------------------
-# УТИЛИТЫ: перевод, STT, TTS
+# Перевод и TTS
 # ---------------------------------------
 
 def translate_text(text: str, src: str, dest: str) -> str:
     if not text.strip():
         return ""
-    translator = GoogleTranslator(source=src, target=dest)
+    if src == "auto":
+        translator = GoogleTranslator(source="auto", target=dest)
+    else:
+        translator = GoogleTranslator(source=src, target=dest)
     return translator.translate(text)
 
 
-def ogg_to_wav(ogg_path: Path) -> Path:
-    wav_path = ogg_path.with_suffix(".wav")
-    audio = AudioSegment.from_file(ogg_path)
-    audio.export(wav_path, format="wav")
-    return wav_path
+def make_tts_file(text: str, lang: str) -> str:
+    tts = gTTS(text=text, lang=lang)
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
+    os.close(tmp_fd)
+    tts.save(tmp_path)
+    return tmp_path
 
 
-def recognize_speech(wav_path: Path, locale: str) -> str | None:
-    r = sr.Recognizer()
-    with sr.AudioFile(str(wav_path)) as source:
-        audio_data = r.record(source)
-    try:
-        text = r.recognize_google(audio_data, language=locale)
-        logger.info("Распознано (%s): %s", locale, text)
-        return text
-    except sr.UnknownValueError:
-        logger.warning("Google STT не смог распознать речь")
-        return None
-    except sr.RequestError as e:
-        logger.error("Ошибка STT: %s", e)
-        return None
-
-
-def synthesize_voice(text: str, lang_code: str) -> BytesIO | None:
-    try:
-        tts_lang = TTS_LANG.get(lang_code, "de")
-        tts = gTTS(text=text, lang=tts_lang)
-        bio = BytesIO()
-        tts.write_to_fp(bio)
-        bio.seek(0)
-        return bio
-    except Exception as e:
-        logger.error("Ошибка gTTS: %s", e)
-        return None
+def convert_ogg_to_wav(input_path: str) -> str:
+    # pydub + ffmpeg
+    audio = AudioSegment.from_file(input_path)
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav")
+    os.close(tmp_fd)
+    audio.export(tmp_path, format="wav")
+    return tmp_path
 
 
 # ---------------------------------------
-# КЛАВИАТУРЫ
+# Handlers
 # ---------------------------------------
 
-def make_direction_keyboard() -> InlineKeyboardMarkup:
-    rows = [
-        ["ru_de", "de_ru"],
-        ["en_de", "de_en"],
-        ["tr_de", "de_tr"],
-        ["ro_de", "de_ro"],
-        ["pl_de", "de_pl"],
-        ["ar_de", "de_ar"],
-    ]
-    keyboard: list[list[InlineKeyboardButton]] = []
-    for row in rows:
-        btn_row: list[InlineKeyboardButton] = []
-        for key in row:
-            info = DIRECTIONS[key]
-            btn_row.append(InlineKeyboardButton(info["label"], callback_data=f"setdir_{key}"))
-        keyboard.append(btn_row)
-    return InlineKeyboardMarkup(keyboard)
-
-
-def make_lang_keyboard() -> InlineKeyboardMarkup:
-    keyboard: list[list[InlineKeyboardButton]] = []
-    row: list[InlineKeyboardButton] = []
-    for code, info in UI_LANGS.items():
-        row.append(
-            InlineKeyboardButton(
-                f"{info['flag']} {info['label']}",
-                callback_data=f"uilang_{code}",
-            )
-        )
-        if len(row) == 3:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
-    return InlineKeyboardMarkup(keyboard)
-
-
-# ---------------------------------------
-# ХЕНДЛЕРЫ КОМАНД
-# ---------------------------------------
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    if not user:
-        return
-    state = get_user_state(user.id)
-    direction_key = state.get("direction", "ru_de")
-    direction_label = DIRECTIONS[direction_key]["label"]
-    group = state.get("group", "free")
-    group_name = GROUP_LABELS_RU.get(group, group)
-    limit = get_daily_limit(user.id, state)
-    used = state["used_today"]
-    left = None if limit is None else max(limit - used, 0)
+    st = get_user_state(user.id)
+    lang = st.ui_lang
+    dir_obj = DIRECTIONS.get(st.direction_code, DIRECTIONS[DEFAULT_DIRECTION])
 
-    ui_lang_code = get_ui_lang(user.id)
-    ui_lang_flag = UI_LANGS[ui_lang_code]["flag"]
-    ui_lang_label = UI_LANGS[ui_lang_code]["label"]
+    if lang == "ru":
+        group_name = group_name_rus(st.group)
+    else:
+        group_name = group_name_en(st.group)
 
-    txt_template = L(user.id, "start")
-    text = txt_template.format(
-        direction=direction_label,
+    limit = get_limit_for_user(user.id, st.group)
+    limit_text = format_limit_text(limit, lang)
+    left = "∞" if limit is None else max(limit - st.used_today, 0)
+
+    text = get_text(lang, "start").format(
+        direction_label=dir_obj.label,
         group_name=group_name,
-        limit_line=format_limit_line(user.id, limit),
-        used=used,
-        left="∞" if left is None else left,
-        ui_lang_flag=ui_lang_flag,
-        ui_lang_label=ui_lang_label,
+        limit_text=limit_text,
+        used_today=st.used_today,
+        left_today=left,
     )
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         text,
-        reply_markup=make_direction_keyboard(),
+        reply_markup=build_direction_keyboard(st.direction_code),
+        parse_mode="Markdown",
     )
 
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user or not update.message:
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    st = get_user_state(update.effective_user.id)
+    lang = st.ui_lang
+    await update.effective_message.reply_text(get_text(lang, "help"))
+
+
+async def cmd_help_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    st = get_user_state(user_id)
+    lang = st.ui_lang
+
+    if user_id not in ADMIN_IDS:
+        await update.effective_message.reply_text(get_text(lang, "only_for_admin"))
         return
-    await update.message.reply_text(L(user.id, "help_student"))
+
+    await update.effective_message.reply_text(
+        get_text(lang, "help_admin"), parse_mode="Markdown"
+    )
 
 
-async def pricing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_pricing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    st = get_user_state(update.effective_user.id)
+    lang = st.ui_lang
+    await update.effective_message.reply_text(
+        get_text(lang, "pricing"), parse_mode="Markdown"
+    )
+
+
+async def cmd_groupinfo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    st = get_user_state(update.effective_user.id)
+    lang = st.ui_lang
+    await update.effective_message.reply_text(
+        get_text(lang, "groupinfo"), parse_mode="Markdown"
+    )
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    if not user or not update.message:
-        return
-    await update.message.reply_text(L(user.id, "pricing"))
+    st = get_user_state(user.id)
+    lang = st.ui_lang
 
+    if lang == "ru":
+        group_name = group_name_rus(st.group)
+    else:
+        group_name = group_name_en(st.group)
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user or not update.message:
-        return
-    state = get_user_state(user.id)
-    group = state.get("group", "free")
-    group_name = GROUP_LABELS_RU.get(group, group)
-    limit = get_daily_limit(user.id, state)
-    used = state["used_today"]
-    left = None if limit is None else max(limit - used, 0)
+    limit = get_limit_for_user(user.id, st.group)
+    limit_text = format_limit_text(limit, lang)
+    left = "∞" if limit is None else max(limit - st.used_today, 0)
 
-    txt_template = L(user.id, "status")
-    text = txt_template.format(
+    text = get_text(lang, "status").format(
         group_name=group_name,
-        limit_line=format_limit_line(user.id, limit),
-        used=used,
-        left="∞" if left is None else left,
+        limit_text=limit_text,
+        used_today=st.used_today,
+        left_today=left,
     )
-    await update.message.reply_text(text)
+    await update.effective_message.reply_text(text)
 
 
-async def groupinfo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    if not user or not update.message:
-        return
-    txt_template = L(user.id, "groupinfo")
-    text = txt_template.format(
-        a1=GROUP_TEACHERS_RU["a1"],
-        a2=GROUP_TEACHERS_RU["a2"],
-        b1=GROUP_TEACHERS_RU["b1"],
-        vip=GROUP_TEACHERS_RU["vip"],
-    )
-    await update.message.reply_text(text)
+    st = get_user_state(user.id)
+    lang = st.ui_lang
 
-
-async def password_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user or not update.message:
-        return
-    args = context.args
-    if not args:
-        await update.message.reply_markdown(L(user.id, "password_usage"))
+    if not context.args:
+        await update.effective_message.reply_text(
+            get_text(lang, "password_howto"), parse_mode="Markdown"
+        )
         return
 
-    pwd = args[0].strip()
-    group = GROUP_PASSWORDS.get(pwd)
+    pwd = context.args[0].strip()
+    group = PASSWORDS.get(pwd)
     if not group:
-        await update.message.reply_text(L(user.id, "password_bad"))
+        await update.effective_message.reply_text(get_text(lang, "password_bad"))
         return
 
-    state = get_user_state(user.id)
-    state["group"] = group
-    limit = get_daily_limit(user.id, state)
-    txt_template = L(user.id, "password_ok")
-    text = txt_template.format(
-        group_name=GROUP_LABELS_RU.get(group, group),
-        limit_line=format_limit_line(user.id, limit),
-    )
-    await update.message.reply_text(text)
+    st.group = group
+    limit = get_limit_for_user(user.id, st.group)
+    limit_text = format_limit_text(limit, lang)
 
+    if lang == "ru":
+        group_name = group_name_rus(st.group)
+    else:
+        group_name = group_name_en(st.group)
 
-async def lang_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user or not update.message:
-        return
-    await update.message.reply_text(
-        L(user.id, "lang_choose"),
-        reply_markup=make_lang_keyboard(),
+    await update.effective_message.reply_text(
+        get_text(lang, "password_ok").format(
+            group_name=group_name, limit_text=limit_text
+        )
     )
 
 
-async def adminhelp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user or not update.message:
-        return
-    if user.id not in ADMINS:
-        await update.message.reply_text(L(user.id, "admin_denied"))
-        return
-
-    # статистика по группам
-    counts = {"free": 0, "a1": 0, "a2": 0, "b1": 0, "vip": 0}
-    total_used_today = 0
-    for st in USERS.values():
-        g = st.get("group", "free")
-        counts[g] = counts.get(g, 0) + 1
-        total_used_today += st.get("used_today", 0)
-
-    header = L(user.id, "admin_header")
-    body_template = L(user.id, "admin_body")
-    body = body_template.format(
-        total_users=len(USERS),
-        free=counts.get("free", 0),
-        a1=counts.get("a1", 0),
-        a2=counts.get("a2", 0),
-        b1=counts.get("b1", 0),
-        vip=counts.get("vip", 0),
-        total_used_today=total_used_today,
+async def cmd_lang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    st = get_user_state(update.effective_user.id)
+    lang = st.ui_lang
+    await update.effective_message.reply_text(
+        get_text(lang, "lang_choose"),
+        reply_markup=build_lang_keyboard(lang),
     )
-    await update.message.reply_text(f"{header}\n\n{body}")
 
 
-# ---------------------------------------
-# CALLBACK: смена направления / языка UI
-# ---------------------------------------
-
-async def direction_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    if not query:
-        return
     await query.answer()
-    user = query.from_user
-    state = get_user_state(user.id)
+    user_id = query.from_user.id
+    st = get_user_state(user_id)
+    lang = st.ui_lang
 
     data = query.data or ""
-    if not data.startswith("setdir_"):
-        return
-    key = data[len("setdir_") :]
-    if key not in DIRECTIONS:
-        return
+    if data.startswith("dir:"):
+        code = data.split(":", 1)[1]
+        if code in DIRECTIONS:
+            st.direction_code = code
+            dir_obj = DIRECTIONS[code]
+            await query.edit_message_reply_markup(
+                reply_markup=build_direction_keyboard(code)
+            )
+            await query.message.reply_text(
+                get_text(lang, "direction_set").format(
+                    direction_label=dir_obj.label
+                )
+            )
+    elif data.startswith("lang:"):
+        code = data.split(":", 1)[1]
+        if code in SUPPORTED_UI_LANGS:
+            st.ui_lang = code
+            lang = code
+            await query.edit_message_reply_markup(
+                reply_markup=build_lang_keyboard(code)
+            )
+            await query.message.reply_text(
+                get_text(lang, "lang_set").format(lang_code=code.upper())
+            )
 
-    state["direction"] = key
-    direction_label = DIRECTIONS[key]["label"]
-    text = f"✅ Направление перевода установлено: {direction_label}"
-    await query.edit_message_reply_markup(reply_markup=make_direction_keyboard())
-    await query.message.reply_text(text)
-
-
-async def lang_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query:
-        return
-    await query.answer()
-    user = query.from_user
-
-    data = query.data or ""
-    if not data.startswith("uilang_"):
-        return
-    code = data[len("uilang_") :]
-    if code not in UI_LANGS:
-        return
-
-    set_ui_lang(user.id, code)
-    info = UI_LANGS[code]
-    msg = L(user.id, "lang_set").format(flag=info["flag"], label=info["label"])
-    await query.message.reply_text(msg)
-
-
-# ---------------------------------------
-# ОБРАБОТКА ТЕКСТА И ГОЛОСА
-# ---------------------------------------
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    message = update.message
-    if not user or not message:
-        return
+    st = get_user_state(user.id)
+    lang = st.ui_lang
+    text = update.effective_message.text or ""
 
-    ok, limit, used, left = check_and_increment_usage(user.id)
+    ok, used, limit = check_and_consume(user.id)
     if not ok:
-        txt_template = L(user.id, "limit_reached")
-        await message.reply_text(
-            txt_template.format(
-                group_name=GROUP_LABELS_RU.get(get_user_state(user.id)["group"], "—"),
-                limit=limit,
+        limit_text = format_limit_text(limit, lang)
+        if lang == "ru":
+            group_name = group_name_rus(st.group)
+        else:
+            group_name = group_name_en(st.group)
+        await update.effective_message.reply_text(
+            get_text(lang, "limit_reached").format(
+                group_name=group_name, limit_text=limit_text
             )
         )
         return
 
-    state = get_user_state(user.id)
-    direction = DIRECTIONS[state["direction"]]
-    src = direction["src"]
-    dest = direction["dest"]
+    dir_obj = DIRECTIONS.get(st.direction_code, DIRECTIONS[DEFAULT_DIRECTION])
+    translated = translate_text(text, dir_obj.src_lang, dir_obj.dest_lang)
 
-    try:
-        translated = translate_text(message.text, src, dest)
-    except Exception as e:
-        logger.error("Ошибка перевода: %s", e)
-        await message.reply_text(L(user.id, "error_generic"))
-        return
-
-    txt_template = L(user.id, "translation_header")
-    answer_text = txt_template.format(
-        original=message.text,
-        src=src.upper(),
-        dest=dest.upper(),
+    reply = get_text(lang, "translation_reply").format(
+        src=dir_obj.src_lang.upper(),
+        dest=dir_obj.dest_lang.upper(),
+        original=text,
         translated=translated,
     )
-    await message.reply_text(answer_text)
 
-    # Попробуем озвучить результат
-    voice_io = synthesize_voice(translated, dest)
-    if voice_io is not None:
-        await message.reply_voice(voice_io)
+    await update.effective_message.reply_text(reply, parse_mode="Markdown")
+    await update.effective_message.reply_text(get_text(lang, "text_limit_warn"))
+
+    # TTS
+    try:
+        tts_path = make_tts_file(translated, dir_obj.tts_lang)
+        with open(tts_path, "rb") as f:
+            await update.effective_message.reply_voice(
+                voice=InputFile(f),
+                caption=f"{dir_obj.dest_lang.upper()} TTS",
+            )
+    finally:
+        if "tts_path" in locals() and os.path.exists(tts_path):
+            os.remove(tts_path)
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    message = update.message
-    if not user or not message or not message.voice:
-        return
+    st = get_user_state(user.id)
+    lang = st.ui_lang
 
-    ok, limit, used, left = check_and_increment_usage(user.id)
+    ok, used, limit = check_and_consume(user.id)
     if not ok:
-        txt_template = L(user.id, "limit_reached")
-        await message.reply_text(
-            txt_template.format(
-                group_name=GROUP_LABELS_RU.get(get_user_state(user.id)["group"], "—"),
-                limit=limit,
+        limit_text = format_limit_text(limit, lang)
+        if lang == "ru":
+            group_name = group_name_rus(st.group)
+        else:
+            group_name = group_name_en(st.group)
+        await update.effective_message.reply_text(
+            get_text(lang, "limit_reached").format(
+                group_name=group_name, limit_text=limit_text
             )
         )
         return
 
-    state = get_user_state(user.id)
-    direction = DIRECTIONS[state["direction"]]
-    src = direction["src"]
-    dest = direction["dest"]
-    locale = direction["stt_locale"]
+    dir_obj = DIRECTIONS.get(st.direction_code, DIRECTIONS[DEFAULT_DIRECTION])
 
-    # Скачиваем voice во временный файл
-    file = await message.voice.get_file()
-    fd, ogg_path_str = tempfile.mkstemp(suffix=".oga")
-    os.close(fd)
-    ogg_path = Path(ogg_path_str)
-    await file.download_to_drive(custom_path=str(ogg_path))
+    msg = update.effective_message
+    voice = msg.voice or msg.audio
+    if not voice:
+        return
 
-    try:
-        wav_path = ogg_to_wav(ogg_path)
-        recognized = recognize_speech(wav_path, locale)
-    finally:
-        # Чистим временные файлы
+    note = await msg.reply_text(get_text(lang, "recognizing"))
+
+    # Скачиваем файл
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ogg_path = os.path.join(tmpdir, "voice.ogg")
+        wav_path = os.path.join(tmpdir, "voice.wav")
+
+        file = await context.bot.get_file(voice.file_id)
+        await file.download_to_drive(ogg_path)
+
         try:
-            if ogg_path.exists():
-                ogg_path.unlink()
-            if "wav_path" in locals() and wav_path.exists():
-                wav_path.unlink()
+            wav_path = convert_ogg_to_wav(ogg_path)
         except Exception as e:
-            logger.warning("Не удалось удалить временный файл: %s", e)
+            logger.exception("Ошибка при конвертации аудио: %s", e)
+            await note.edit_text(get_text(lang, "nothing_recognized"))
+            return
 
-    if not recognized:
-        await message.reply_text(L(user.id, "no_speech"))
-        return
+        recognizer = sr.Recognizer()
+        try:
+            with sr.AudioFile(wav_path) as source:
+                audio = recognizer.record(source)
+            logger.info(
+                "Распознаю речь с locale=%s",
+                dir_obj.speech_locale,
+            )
+            text = recognizer.recognize_google(
+                audio, language=dir_obj.speech_locale
+            )
+            logger.info("Распознано: %r", text)
+        except sr.UnknownValueError:
+            logger.warning("Не удалось распознать речь")
+            await note.edit_text(get_text(lang, "nothing_recognized"))
+            return
+        except Exception as e:
+            logger.exception("Ошибка распознавания: %s", e)
+            await note.edit_text(get_text(lang, "nothing_recognized"))
+            return
 
-    try:
-        translated = translate_text(recognized, src, dest)
-    except Exception as e:
-        logger.error("Ошибка перевода: %s", e)
-        await message.reply_text(L(user.id, "error_generic"))
-        return
+    # Перевод
+    translated = translate_text(text, dir_obj.src_lang, dir_obj.dest_lang)
+    await note.delete()
 
-    txt_template = L(user.id, "translation_header")
-    answer_text = txt_template.format(
-        original=recognized,
-        src=src.upper(),
-        dest=dest.upper(),
+    reply = get_text(lang, "translation_reply").format(
+        src=dir_obj.src_lang.upper(),
+        dest=dir_obj.dest_lang.upper(),
+        original=text,
         translated=translated,
     )
-    await message.reply_text(answer_text)
+    await msg.reply_text(reply, parse_mode="Markdown")
 
-    # Озвучиваем результат
-    voice_io = synthesize_voice(translated, dest)
-    if voice_io is not None:
-        await message.reply_voice(voice_io)
-
-
-# ---------------------------------------
-# ERROR HANDLER
-# ---------------------------------------
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Exception while handling update: %s", context.error, exc_info=context.error)
-    # Аккуратно пытаться уведомить пользователя
+    # TTS
     try:
-        if isinstance(update, Update):
-            user = update.effective_user
-            message = update.effective_message
-            if user and message:
-                await message.reply_text(L(user.id, "error_generic"))
-    except Exception:
-        pass
+        tts_path = make_tts_file(translated, dir_obj.tts_lang)
+        with open(tts_path, "rb") as f:
+            await msg.reply_voice(
+                voice=InputFile(f),
+                caption=f"{dir_obj.dest_lang.upper()} TTS",
+            )
+    finally:
+        if "tts_path" in locals() and os.path.exists(tts_path):
+            os.remove(tts_path)
 
 
 # ---------------------------------------
-# MAIN
+# main / webhook
 # ---------------------------------------
-
-def build_application() -> Application:
-    application = Application.builder().token(BOT_TOKEN).build()
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_cmd))
-    application.add_handler(CommandHandler("pricing", pricing))
-    application.add_handler(CommandHandler("status", status))
-    application.add_handler(CommandHandler("groupinfo", groupinfo))
-    application.add_handler(CommandHandler("password", password_cmd))
-    application.add_handler(CommandHandler("lang", lang_cmd))
-    application.add_handler(CommandHandler("adminhelp", adminhelp))
-
-    application.add_handler(CallbackQueryHandler(direction_button, pattern=r"^setdir_"))
-    application.add_handler(CallbackQueryHandler(lang_button, pattern=r"^uilang_"))
-
-    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    application.add_error_handler(error_handler)
-
-    return application
-
 
 def main() -> None:
-    application = build_application()
+    application = Application.builder().token(BOT_TOKEN).build()
 
-    if BASE_WEBHOOK_URL:
-        webhook_url = BASE_WEBHOOK_URL.rstrip("/") + "/webhook"
-        logger.info("Запускаю webhook на %s, порт %s", webhook_url, PORT)
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path="webhook",
-            webhook_url=webhook_url,
-        )
-    else:
-        logger.warning(
-            "BASE_WEBHOOK_URL не задан, запускаю long polling "
-            "(на Render так работать не будет)."
-        )
-        application.run_polling()
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("help", cmd_help))
+    application.add_handler(CommandHandler("help_admin", cmd_help_admin))
+    application.add_handler(CommandHandler("pricing", cmd_pricing))
+    application.add_handler(CommandHandler("groupinfo", cmd_groupinfo))
+    application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("password", cmd_password))
+    application.add_handler(CommandHandler("lang", cmd_lang))
+
+    application.add_handler(CallbackQueryHandler(on_callback))
+
+    application.add_handler(
+        MessageHandler(filters.VOICE | filters.AUDIO, handle_voice)
+    )
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
+    )
+
+    # Webhook config for Render
+    webhook_url = BASE_WEBHOOK_URL or f"{BASE_URL.rstrip('/')}/webhook"
+    logger.info(
+        "Запускаю webhook на %s, порт %s",
+        webhook_url,
+        PORT,
+    )
+
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path="webhook",
+        webhook_url=webhook_url,
+    )
 
 
 if __name__ == "__main__":
