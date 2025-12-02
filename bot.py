@@ -121,6 +121,12 @@ TEXTS = {
         "start_left": "Осталось переводов",
         "start_password": "🔑 Чтобы снять ограничения, введи пароль командой /password",
         "start_lang_hint": "🌐 Язык интерфейса можно сменить командой /lang (или /setlang)",
+        "start_commands": (
+            "💶 Тарифы и оплата: /pricing\n"
+            "📊 Статус лимитов: /status\n"
+            "ℹ️ Информация по группам: /groupinfo\n"
+            "❓ Помощь: /help"
+        ),
         "lang_choose": "Выбери язык интерфейса:",
         "lang_set": "Язык интерфейса переключен на: {lang}",
         "unknown_lang": "Этот язык интерфейса пока не поддерживается.",
@@ -189,6 +195,12 @@ TEXTS = {
         "start_left": "Left today",
         "start_password": "🔑 To unlock full access, use /password and enter your code from teacher.",
         "start_lang_hint": "🌐 You can change interface language with /lang (or /setlang)",
+        "start_commands": (
+            "💶 Pricing & payment: /pricing\n"
+            "📊 Limit status: /status\n"
+            "ℹ️ Group info: /groupinfo\n"
+            "❓ Help: /help"
+        ),
         "lang_choose": "Choose interface language:",
         "lang_set": "Interface language set to: {lang}",
         "unknown_lang": "This language is not supported yet.",
@@ -366,7 +378,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{t(user.id,'start_group')}: {TIER_NAMES.get(tier, tier)}\n"
         f"{limit_line}\n\n"
         f"{t(user.id,'start_password')}\n"
-        f"{t(user.id,'start_lang_hint')}"
+        f"{t(user.id,'start_lang_hint')}\n"
+        f"{t(user.id,'start_commands')}"
     )
 
     await update.effective_message.reply_text(
