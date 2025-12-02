@@ -1,8 +1,7 @@
 import os
 import io
-import asyncio
 import logging
-from datetime import datetime, date
+from datetime import date
 
 from telegram import (
     Update,
@@ -22,8 +21,6 @@ import speech_recognition as sr
 from pydub import AudioSegment
 from gtts import gTTS
 
-import httpx
-
 logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     level=logging.INFO,
@@ -34,23 +31,19 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 BASE_URL = os.environ.get("BASE_URL", "https://bratik.onrender.com")
 PORT = int(os.environ.get("PORT", "10000"))
 
-# --- Состояние пользователей в памяти ---------------------------------------
+# ------------------- состояние пользователей ------------------------
 
-# user_id -> dict
 USER_STATE: dict[int, dict] = {}
 
-# id друга с безлимитом
-FRIEND_ID = 1300323894
-
-# --- Тарифы и лимиты ---------------------------------------------------------
+FRIEND_ID = 1300323894  # друг с безлимитом
 
 TIER_LIMITS_PER_DAY = {
-    "demo": 15,     # бесплатный демо
+    "demo": 15,
     "a1": 30,
     "a2": 60,
     "b1": 100,
-    "vip": 10_000,  # фактически безлимит
-    "testweek": 50, # примерный лимит на тестовую неделю
+    "vip": 10_000,     # почти бесконечный
+    "testweek": 50,
 }
 
 TIER_NAMES = {
@@ -62,7 +55,7 @@ TIER_NAMES = {
     "testweek": "Test week",
 }
 
-# Пароли (их не показываем пользователю)
+# реальные пароли — только в коде, пользователю их не показываем
 PASSWORDS = {
     "karbofos-a1": "a1",
     "karbofos-a2": "a2",
@@ -71,9 +64,8 @@ PASSWORDS = {
     "karbofos-test": "testweek",
 }
 
-# --- Языки перевода ----------------------------------------------------------
+# ------------------- языки перевода ---------------------------------
 
-# пары: код → locale для распознавания речи
 LANG_LOCALES = {
     "ru": "ru-RU",
     "de": "de-DE",
@@ -84,7 +76,6 @@ LANG_LOCALES = {
     "ar": "ar-SY",
 }
 
-# какие пары перевода доступны
 DIRECTIONS = {
     "ru_de": ("ru", "de"),
     "de_ru": ("de", "ru"),
@@ -100,7 +91,6 @@ DIRECTIONS = {
     "de_ar": ("de", "ar"),
 }
 
-# подписи для кнопок направлений
 DIRECTION_LABELS = {
     "ru_de": "🇷🇺 RU → 🇩🇪 DE",
     "de_ru": "🇩🇪 DE → 🇷🇺 RU",
@@ -116,35 +106,37 @@ DIRECTION_LABELS = {
     "de_ar": "🇩🇪 DE → 🇸🇾 AR(SY)",
 }
 
-# --- Язык интерфейса ---------------------------------------------------------
+# ------------------- язык интерфейса --------------------------------
 
-# ui_lang: 'ru', 'de', 'en', 'tr', 'ro', 'pl', 'ar'
 SUPPORTED_UI_LANGS = ["ru", "de", "en", "tr", "ro", "pl", "ar"]
 
-# простые тексты для интерфейса
 TEXTS = {
     "ru": {
         "start_title": "Привет! Я голосовой переводчик для курсов немецкого.",
-        "start_howto": "Отправь мне голосовое сообщение — я распознаю речь, переведу и озвучу ответ.",
+        "start_howto": "Отправь мне голосовое сообщение — я распознаю речь, переведу и озвучу её.",
         "start_dir": "Текущее направление перевода:",
         "start_group": "Текущая группа",
         "start_limit": "Лимит на сегодня",
         "start_used": "Сегодня использовано",
         "start_left": "Осталось переводов",
         "start_password": "🔑 Чтобы снять ограничения, введи пароль командой /password",
-        "start_lang_hint": "🌐 Язык интерфейса можно сменить командой /lang",
+        "start_lang_hint": "🌐 Язык интерфейса можно сменить командой /lang (или /setlang)",
         "lang_choose": "Выбери язык интерфейса:",
         "lang_set": "Язык интерфейса переключен на: {lang}",
         "unknown_lang": "Этот язык интерфейса пока не поддерживается.",
         "direction_set": "Направление перевода установлено: {label}",
         "direction_same": "Это направление уже выбрано 👍",
-        "send_password_usage": "🔑 Отправь пароль вот так:\n\n`/password ТВОЙ_КОД`\n\nКод выдает только преподаватель.",
+        "send_password_usage": (
+            "🔑 Отправь пароль вот так:\n\n"
+            "`/password ТВОЙ_КОД`\n\n"
+            "Код выдаёт только преподаватель."
+        ),
         "password_ok": "Пароль принят ✅\nТвой уровень: {tier_name}\nЛимит в день: {limit}",
         "password_bad": "Пароль не подошёл 😔\nПроверь код или обратись к преподавателю.",
         "status_title": "Статус:",
         "status_tier": "Группа: {tier}\nЛимит в день: {limit}\nСегодня использовано: {used}\nОсталось: {left}",
         "no_limit": "Группа: {tier}\nЛимит: без ограничений\nСегодня использовано: {used}",
-        "limit_reached": "На сегодня лимит переводов исчерпан для твоего тарифа. Обратись к преподавателю за повышением уровня.",
+        "limit_reached": "На сегодня лимит переводов исчерпан. Обратись к преподавателю за повышением уровня.",
         "pricing": (
             "📊 *Тарифы и лимиты в день:*\n"
             "• Free (DEMO) — 15 переводов\n"
@@ -174,16 +166,16 @@ TEXTS = {
             "1. Нажми /start — выбери направление перевода.\n"
             "2. Отправь голосовое сообщение или текст.\n"
             "3. Я распознаю, переведу и озвучу ответ.\n\n"
-            "🔑 Чтобы убрать демо-ограничение, возьми у преподавателя пароль и введи его командой:\n"
+            "🔑 Чтобы убрать демо-ограничение, возьми у преподавателя пароль и введи его так:\n"
             "`/password ТВОЙ_КОД`"
         ),
         "help_admin": (
             "🛠 *Админ-help*\n\n"
-            "Пока все админ-действия делаются вручную через пароли уровней.\n"
-            "Планы: добавить отдельные команды для сброса лимитов и выдачи уровней.\n"
+            "• Уровни доступа выдаются паролями (A1/A2/B1/PRO/testweek).\n"
+            "• Лимиты обновляются каждый день автоматически.\n"
+            "• Друг в Германии (ID 1300323894) имеет PRO-безлимит.\n"
         ),
         "speech_fail": "Не удалось распознать речь. Попробуй ещё раз, говори ближе к микрофону.",
-        "translating": "Перевожу...",
         "original": "Оригинал",
         "translation": "Перевод",
     },
@@ -196,13 +188,17 @@ TEXTS = {
         "start_used": "Used today",
         "start_left": "Left today",
         "start_password": "🔑 To unlock full access, use /password and enter your code from teacher.",
-        "start_lang_hint": "🌐 You can change interface language with /lang",
+        "start_lang_hint": "🌐 You can change interface language with /lang (or /setlang)",
         "lang_choose": "Choose interface language:",
         "lang_set": "Interface language set to: {lang}",
         "unknown_lang": "This language is not supported yet.",
         "direction_set": "Translation direction set to: {label}",
         "direction_same": "This direction is already selected 👍",
-        "send_password_usage": "🔑 Send your password like this:\n\n`/password YOUR_CODE`\n\nYou receive the code only from your teacher.",
+        "send_password_usage": (
+            "🔑 Send your password like this:\n\n"
+            "`/password YOUR_CODE`\n\n"
+            "You get the code only from your teacher."
+        ),
         "password_ok": "Password accepted ✅\nYour level: {tier_name}\nDaily limit: {limit}",
         "password_bad": "Password is not valid. Please check it with your teacher.",
         "status_title": "Status:",
@@ -243,17 +239,17 @@ TEXTS = {
         ),
         "help_admin": (
             "🛠 *Admin help*\n\n"
-            "For now, access levels are controlled via passwords only.\n"
-            "More admin commands may be added later."
+            "Access levels are controlled via passwords (A1/A2/B1/PRO/testweek).\n"
+            "Daily limits reset automatically each day.\n"
+            "Your friend in Germany (ID 1300323894) has PRO unlimited plan.\n"
         ),
         "speech_fail": "Couldn’t recognize speech. Please try again.",
-        "translating": "Translating...",
         "original": "Original",
         "translation": "Translation",
     },
 }
 
-# Для остальных языков интерфейса просто используем английский как fallback
+# остальные языки интерфейса по умолчанию используют английские тексты
 for l in ["de", "tr", "ro", "pl", "ar"]:
     if l not in TEXTS:
         TEXTS[l] = TEXTS["en"]
@@ -269,11 +265,10 @@ def get_user_state(user_id: int) -> dict:
             "direction": "ru_de",
             "ui_lang": "ru",
         }
-        # другу сразу даём vip
         if user_id == FRIEND_ID:
             st["tier"] = "vip"
         USER_STATE[user_id] = st
-    # обнуление по дате
+
     today = date.today().isoformat()
     if st["date"] != today:
         st["date"] = today
@@ -292,7 +287,6 @@ def t(user_id: int, key: str, **kwargs) -> str:
 
 
 def make_direction_keyboard(current: str) -> InlineKeyboardMarkup:
-    # 6 рядов по 2 кнопки
     rows = [
         ["ru_de", "de_ru"],
         ["en_de", "de_en"],
@@ -340,16 +334,18 @@ def make_lang_keyboard(current: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
+# ----------------------- команды ------------------------------------
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     st = get_user_state(user.id)
 
-    src, dst = DIRECTIONS[st["direction"]]
     dir_label = DIRECTION_LABELS[st["direction"]]
 
     tier = st["tier"]
-    daily = TIER_LIMITS_PER_DAY.get(tier)
     used = st["used_today"]
+    daily = TIER_LIMITS_PER_DAY.get(tier)
 
     if daily:
         left = max(daily - used, 0)
@@ -359,7 +355,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"{t(user.id,'start_left')}: {left}"
         )
     else:
-        limit_line = t(user.id, "no_limit", tier=TIER_NAMES.get(tier, tier), used=used)
+        limit_line = t(
+            user.id, "no_limit", tier=TIER_NAMES.get(tier, tier), used=used
+        )
 
     text = (
         f"{t(user.id,'start_title')}\n\n"
@@ -388,12 +386,12 @@ async def cmd_lang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    st = get_user_state(user.id)
     args = context.args
 
     if not args:
         await update.effective_message.reply_text(
-            t(user.id, "send_password_usage"), parse_mode="Markdown"
+            t(user.id, "send_password_usage"),
+            parse_mode="Markdown",
         )
         return
 
@@ -403,25 +401,19 @@ async def cmd_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.effective_message.reply_text(t(user.id, "password_bad"))
         return
 
+    st = get_user_state(user.id)
     st["tier"] = tier
     st["used_today"] = 0
     USER_STATE[user.id] = st
 
     limit = TIER_LIMITS_PER_DAY.get(tier)
-    if limit:
-        msg = t(
-            user.id,
-            "password_ok",
-            tier_name=TIER_NAMES.get(tier, tier),
-            limit=limit,
-        )
-    else:
-        msg = t(
-            user.id,
-            "password_ok",
-            tier_name=TIER_NAMES.get(tier, tier),
-            limit="∞",
-        )
+    limit_value = limit if limit else "∞"
+    msg = t(
+        user.id,
+        "password_ok",
+        tier_name=TIER_NAMES.get(tier, tier),
+        limit=limit_value,
+    )
     await update.effective_message.reply_text(msg)
 
 
@@ -451,7 +443,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             used=used,
         )
 
-    await update.effective_message.reply_text(f"{t(user.id,'status_title')}\n\n{msg}")
+    await update.effective_message.reply_text(
+        f"{t(user.id,'status_title')}\n\n{msg}"
+    )
 
 
 async def cmd_pricing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -486,7 +480,7 @@ async def cmd_adminhelp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
-# --- Callback-кнопки ---------------------------------------------------------
+# ------------------- callback-кнопки ---------------------------------
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -509,9 +503,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         label = DIRECTION_LABELS[new_dir]
         try:
             await query.edit_message_text(
-                t(user.id, "start_title")
-                + "\n\n"
-                + t(user.id, "direction_set", label=label),
+                t(user.id, "direction_set", label=label),
                 reply_markup=make_direction_keyboard(new_dir),
             )
         except Exception as e:
@@ -532,11 +524,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
 
-# --- Перевод сообщений -------------------------------------------------------
+# ------------------- лимиты и обработка сообщений --------------------
 
 
 def increment_and_check_limit(user_id: int) -> bool:
-    """True если можно делать перевод, False если лимит кончился."""
     st = get_user_state(user_id)
     if st["tier"] == "vip" or user_id == FRIEND_ID:
         return True
@@ -569,16 +560,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "Translating text for %s: %s (%s→%s)", user.id, text, src, dst
     )
 
-    await update.effective_message.chat.send_action("typing")
-
     try:
         translated = GoogleTranslator(source=src, target=dst).translate(text)
-    except Exception as e:
-        logger.exception("translate error: %s", e)
+    except Exception:
+        logger.exception("translate error")
         await update.effective_message.reply_text("Ошибка перевода.")
         return
 
-    # озвучка
     try:
         tts = gTTS(translated, lang=dst)
         buf = io.BytesIO()
@@ -586,12 +574,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         buf.seek(0)
         await update.effective_message.reply_voice(
             voice=buf,
-            caption=f"🗣 *{t(user.id,'original')}:*\n{text}\n\n"
-                    f"✅ *{t(user.id,'translation')}:*\n{translated}",
+            caption=(
+                f"🗣 *{t(user.id,'original')}:*\n{text}\n\n"
+                f"✅ *{t(user.id,'translation')}:*\n{translated}"
+            ),
             parse_mode="Markdown",
         )
-    except Exception as e:
-        logger.exception("TTS error: %s", e)
+    except Exception:
+        logger.exception("TTS error")
         await update.effective_message.reply_text(translated)
 
 
@@ -611,7 +601,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     file = await context.bot.get_file(update.message.voice.file_id)
     ogg_bytes = await file.download_as_bytearray()
 
-    # конвертация ogg -> wav
     audio = AudioSegment.from_file(io.BytesIO(ogg_bytes), format="ogg")
     wav_buf = io.BytesIO()
     audio.export(wav_buf, format="wav")
@@ -634,37 +623,35 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.effective_message.reply_text(t(user.id, "speech_fail"))
         return
 
-    await update.effective_message.chat.send_action("record_voice")
-
     try:
         translated = GoogleTranslator(source=src, target=dst).translate(text)
-    except Exception as e:
-        logger.exception("translate error: %s", e)
+    except Exception:
+        logger.exception("translate error")
         await update.effective_message.reply_text("Ошибка перевода.")
         return
 
-    # озвучка
     try:
         tts = gTTS(translated, lang=dst)
         buf = io.BytesIO()
         tts.write_to_fp(buf)
         buf.seek(0)
-
         await update.effective_message.reply_voice(
             voice=buf,
-            caption=f"🗣 *{t(user.id,'original')}:*\n{text}\n\n"
-                    f"✅ *{t(user.id,'translation')}:*\n{translated}",
+            caption=(
+                f"🗣 *{t(user.id,'original')}:*\n{text}\n\n"
+                f"✅ *{t(user.id,'translation')}:*\n{translated}"
+            ),
             parse_mode="Markdown",
         )
-    except Exception as e:
-        logger.exception("TTS error: %s", e)
+    except Exception:
+        logger.exception("TTS error")
         await update.effective_message.reply_text(translated)
 
 
-# --- main --------------------------------------------------------------------
+# ------------------- main -------------------------------------------
 
 
-async def main() -> None:
+def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN env is not set")
 
@@ -674,24 +661,11 @@ async def main() -> None:
         PORT,
     )
 
-    # небольшая пауза чтобы Render успел открыть порт
-    await asyncio.sleep(1.0)
-
-    async with httpx.AsyncClient(timeout=10) as client:
-        # просто проверка токена
-        r = await client.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
-        )
-        r.raise_for_status()
-
-    application = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .build()
-    )
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("lang", cmd_lang))
+    application.add_handler(CommandHandler("setlang", cmd_lang))  # старое название
     application.add_handler(CommandHandler("password", cmd_password))
     application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CommandHandler("pricing", cmd_pricing))
@@ -701,14 +675,12 @@ async def main() -> None:
 
     application.add_handler(CallbackQueryHandler(on_callback))
 
-    # текст (кроме команд)
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )
-    # голос
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
-    await application.run_webhook(
+    application.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         url_path="webhook",
@@ -717,4 +689,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
